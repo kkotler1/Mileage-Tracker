@@ -98,30 +98,92 @@ python -m mileage_tracker.server      # stdio for Claude Code
 
 ### 5. Deploy to Minisforum (HTTP transport, remote MCP URL)
 
-```bash
-MCP_TRANSPORT=streamable-http MCP_PORT=8765 python -m mileage_tracker.server
+**Live endpoint:** `https://minisforum.tail2b7516.ts.net/mcp`
+
+The deployment runs on the Minisforum (Windows + WSL2). The chain is:
+
+```
+claude.ai → Tailscale Funnel → Windows :8765 → netsh port proxy → WSL :8765 → Python server
 ```
 
-Systemd unit (matching the other `open-*` services):
+#### WSL: user systemd service
+
+`~/.config/systemd/user/mileage-tracker.service`:
 
 ```ini
 [Unit]
-Description=mileage-tracker MCP server
+Description=mileage-tracker MCP server (HTTP)
 After=network.target
 
 [Service]
 Type=simple
-User=kyle
-WorkingDirectory=/opt/mileage-tracker
-EnvironmentFile=/opt/mileage-tracker/.env
-ExecStart=/opt/mileage-tracker/.venv/bin/python -m mileage_tracker.server
+WorkingDirectory=/mnt/c/Users/kkotl/projects/mileage-tracker
+EnvironmentFile=/mnt/c/Users/kkotl/projects/mileage-tracker/.env
+Environment=MCP_TRANSPORT=streamable-http
+ExecStart=/mnt/c/Users/kkotl/projects/mileage-tracker/.venv/bin/python -m mileage_tracker.server
 Restart=on-failure
+RestartSec=5
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
 ```
 
-Expose over Tailscale (or your existing reverse proxy) and add the URL as a remote MCP server in claude.ai.
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now mileage-tracker
+loginctl enable-linger kyle   # survive without login session
+```
+
+Note: do **not** set `MCP_TRANSPORT` in `.env` — the systemd `Environment=` line sets it for HTTP mode; Claude Code stdio defaults to stdio when the var is unset.
+
+#### Windows (elevated PowerShell): port proxy + firewall + startup task
+
+The WSL IP changes on reboot, so a startup script keeps the proxy updated.
+
+`C:\Users\kkotl\scripts\setup-wsl-portproxy.ps1`:
+
+```powershell
+$wslIp = (wsl hostname -I 2>$null).Trim().Split()[0]
+if (-not $wslIp) { exit 1 }
+netsh interface portproxy delete v4tov4 listenport=8765 listenaddress=0.0.0.0 | Out-Null
+netsh interface portproxy add v4tov4 listenport=8765 listenaddress=0.0.0.0 connectport=8765 connectaddress=$wslIp
+```
+
+Run once to set up (use current WSL IP), add firewall rule, and register the startup task:
+
+```powershell
+# Set proxy now
+$wslIp = (wsl hostname -I).Trim().Split()[0]
+netsh interface portproxy add v4tov4 listenport=8765 listenaddress=0.0.0.0 connectport=8765 connectaddress=$wslIp
+
+# Firewall
+netsh advfirewall firewall add rule name="WSL mileage-tracker 8765" dir=in action=allow protocol=TCP localport=8765
+
+# Startup task
+schtasks /create /tn "WSL mileage-tracker portproxy" /tr "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\Users\kkotl\scripts\setup-wsl-portproxy.ps1" /sc onstart /ru SYSTEM /f
+```
+
+#### Windows (elevated PowerShell): Tailscale Funnel
+
+```powershell
+tailscale funnel --bg 8765
+```
+
+Exposes port 8765 publicly at `https://minisforum.tail2b7516.ts.net`. Re-run after Windows reboots if the funnel drops (`tailscale serve status` to check).
+
+#### Wire into claude.ai
+
+Settings → Integrations → Add MCP server → `https://minisforum.tail2b7516.ts.net/mcp`
+
+#### Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| Tools missing in claude.ai | `systemctl --user status mileage-tracker` in WSL |
+| Service down | `systemctl --user restart mileage-tracker` |
+| Port proxy missing | Run `setup-wsl-portproxy.ps1` in elevated PowerShell |
+| Funnel stopped | `tailscale funnel --bg 8765` in elevated PowerShell |
+| Wrong WSL IP after reboot | Startup task should fix it automatically; run script manually if not |
 
 ## Notes
 
