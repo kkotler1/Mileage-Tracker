@@ -66,10 +66,46 @@ def ws() -> gspread.Worksheet:
     return worksheet
 
 
+TOTALS_MARKER = "TOTAL"
+
+# Sums everything above the formula's own row — no circular reference.
+_TOTALS_ROW_TEMPLATE = [
+    TOTALS_MARKER, "", "", "",
+    '=SUM(INDIRECT("E2:E"&(ROW()-1)))',
+    '=SUM(INDIRECT("F2:F"&(ROW()-1)))',
+    "", "",
+]
+
+
 def append_trip(row: dict[str, Any]) -> None:
     values = [row.get(h, "") for h in HEADERS]
-    ws().append_row(values, value_input_option="USER_ENTERED")
+    new_date = str(row.get("Date", ""))
+
+    worksheet = ws()
+    all_values = worksheet.get_all_values()
+
+    has_totals = bool(all_values and all_values[-1] and all_values[-1][0] == TOTALS_MARKER)
+    totals_sheet_row = len(all_values) if has_totals else None
+    data_rows = all_values[1:-1] if has_totals else all_values[1:]
+
+    # Find the first data row whose Date is strictly after new_date.
+    insert_index = None
+    for i, sheet_row in enumerate(data_rows, start=2):
+        row_date = sheet_row[0] if sheet_row else ""
+        if new_date and row_date and row_date > new_date:
+            insert_index = i
+            break
+
+    # If no later date, insert just before the totals row (or append if no totals).
+    if insert_index is None:
+        insert_index = totals_sheet_row
+
+    if insert_index is not None:
+        worksheet.insert_row(values, index=insert_index, value_input_option="USER_ENTERED")
+    else:
+        worksheet.append_row(values, value_input_option="USER_ENTERED")
 
 
 def read_trips() -> list[dict[str, Any]]:
-    return ws().get_all_records()
+    # Exclude the totals row from query results.
+    return [r for r in ws().get_all_records() if r.get("Date") != TOTALS_MARKER]
