@@ -175,6 +175,213 @@ def add_location(
 
 
 @mcp.tool
+def log_route(
+    stops: list[str],
+    date: str | None = None,
+    purpose: str | None = None,
+    leg_overrides: list[dict] | None = None,
+) -> dict[str, Any]:
+    """Log a multi-stop business route.
+
+    Typical pattern: Home → stop1 → ... → stopN → Home. Include "home"
+    explicitly in stops — it is not auto-appended. Any sequence of known
+    locations works; home is not required.
+
+    Home-adjacent legs use each location's miles_from_home. Inter-stop legs
+    come from the cached leg-distance table. Missing inter-stop legs return
+    needs_legs with all unknown pairs at once — call add_leg or pass
+    leg_overrides, then retry.
+
+    Args:
+        stops: Ordered stop names. "home" resolves to your home location.
+            Example: ["home", "Sam's Club", "Walmart", "the club", "home"]
+        date: "today" (default), "yesterday", "N days ago", or ISO date.
+        purpose: Business reason (e.g. "vending route").
+        leg_overrides: Explicit miles for specific legs, overriding the cache.
+            Format: [{"from": "Walmart", "to": "Sam's Club", "miles": 4.6}].
+            Values are saved to the cache for future routes.
+    """
+    if len(stops) < 2:
+        return {"status": "error", "error": "stops must have at least 2 entries"}
+
+    trip_date = parse_date(date)
+    HOME_ID = "home"
+
+    # Resolve stops (home is a special node with no miles_from_home)
+    resolved: list[dict[str, Any]] = []
+    for name in stops:
+        if name.strip().lower() == "home":
+            resolved.append({"id": HOME_ID, "name": "Home"})
+        else:
+            match = loc.resolve(name)
+            if match is None:
+                return _needs_input(name, "unknown_location")
+            resolved.append(match)
+
+    # Resolve leg_overrides once; store (id_a, name_a, id_b, name_b, miles)
+    resolved_overrides: list[tuple[str, str, str, str, float]] = []
+    override_id_map: dict[frozenset, float] = {}
+    if leg_overrides:
+        for ov in leg_overrides:
+            ov_from = (ov.get("from") or "").strip()
+            ov_to = (ov.get("to") or "").strip()
+            try:
+                ov_miles = float(ov["miles"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            if ov_from.lower() == "home":
+                ov_id_a, ov_name_a = HOME_ID, "Home"
+            else:
+                ra = loc.resolve(ov_from)
+                if not ra:
+                    continue
+                ov_id_a, ov_name_a = ra["id"], ra["name"]
+
+            if ov_to.lower() == "home":
+                ov_id_b, ov_name_b = HOME_ID, "Home"
+            else:
+                rb = loc.resolve(ov_to)
+                if not rb:
+                    continue
+                ov_id_b, ov_name_b = rb["id"], rb["name"]
+
+            if ov_id_a == ov_id_b:
+                continue
+            override_id_map[frozenset({ov_id_a, ov_id_b})] = ov_miles
+            resolved_overrides.append((ov_id_a, ov_name_a, ov_id_b, ov_name_b, ov_miles))
+
+    # Build legs
+    legs: list[tuple[str, str, float | None]] = []
+    missing_legs: list[tuple[str, str]] = []
+
+    for i in range(len(resolved) - 1):
+        a, b = resolved[i], resolved[i + 1]
+        pair = frozenset({a["id"], b["id"]})
+
+        if pair in override_id_map:
+            legs.append((a["name"], b["name"], override_id_map[pair]))
+        elif a["id"] == HOME_ID:
+            if b.get("miles_from_home") is None:
+                return _needs_input(b["name"], "missing_miles_from_home")
+            legs.append((a["name"], b["name"], float(b["miles_from_home"])))
+        elif b["id"] == HOME_ID:
+            if a.get("miles_from_home") is None:
+                return _needs_input(a["name"], "missing_miles_from_home")
+            legs.append((a["name"], b["name"], float(a["miles_from_home"])))
+        else:
+            cached = loc.get_leg_distance(a["id"], b["id"])
+            if cached is not None:
+                legs.append((a["name"], b["name"], cached))
+            else:
+                missing_legs.append((a["name"], b["name"]))
+                legs.append((a["name"], b["name"], None))
+
+    if missing_legs:
+        return {
+            "status": "needs_legs",
+            "missing_legs": [{"from": fn, "to": tn} for fn, tn in missing_legs],
+            "instruction": (
+                "Call add_leg for each missing pair, or include them in "
+                "leg_overrides, then retry log_route."
+            ),
+        }
+
+    # Cache overrides; track which inter-stop legs are new
+    newly_cached: list[dict[str, Any]] = []
+    for ov_id_a, ov_name_a, ov_id_b, ov_name_b, ov_miles in resolved_overrides:
+        if ov_id_a == HOME_ID:
+            loc.set_miles_from_home(ov_id_b, ov_miles)
+        elif ov_id_b == HOME_ID:
+            loc.set_miles_from_home(ov_id_a, ov_miles)
+        else:
+            was_cached = loc.get_leg_distance(ov_id_a, ov_id_b) is not None
+            loc.set_leg_distance(ov_id_a, ov_id_b, ov_miles)
+            if not was_cached:
+                newly_cached.append({"from": ov_name_a, "to": ov_name_b, "miles": ov_miles})
+
+    total_miles = round(sum(d for _, _, d in legs), 2)
+    route_label = " → ".join(r["name"] for r in resolved)
+    tid = _trip_id()
+    sheet.append_trip({
+        "Date": trip_date.isoformat(),
+        "Destination": route_label,
+        "Purpose": purpose or "",
+        "Shape": "route",
+        "Miles": total_miles,
+        "Deduction $": _money(total_miles),
+        "Trip ID": tid,
+        "Logged At": _now_iso(),
+    })
+    for r in resolved:
+        if r["id"] != HOME_ID:
+            loc.touch(r["id"])
+
+    result: dict[str, Any] = {
+        "status": "logged",
+        "route": route_label,
+        "date": trip_date.isoformat(),
+        "legs": [{"from": fn, "to": tn, "miles": d} for fn, tn, d in legs],
+        "total_miles": total_miles,
+        "deduction_usd": _money(total_miles),
+        "trip_id": tid,
+    }
+    if newly_cached:
+        result["newly_cached_legs"] = newly_cached
+    return result
+
+
+@mcp.tool
+def add_leg(
+    location_a: str,
+    location_b: str,
+    miles: float,
+) -> dict[str, Any]:
+    """Register the one-way driving distance between two locations.
+
+    Builds up the per-leg cache used by log_route. "Home" is a valid value
+    for either argument — it updates miles_from_home on the other location
+    instead of the inter-stop cache.
+
+    Args:
+        location_a: First location name (or "Home").
+        location_b: Second location name (or "Home").
+        miles: One-way driving miles between them.
+    """
+    if miles < 0:
+        return {"status": "error", "error": "miles must be >= 0"}
+
+    HOME_ID = "home"
+
+    def _resolve(name: str) -> tuple[str | None, str]:
+        if name.strip().lower() == "home":
+            return HOME_ID, "Home"
+        match = loc.resolve(name)
+        if match is None:
+            return None, name
+        return match["id"], match["name"]
+
+    id_a, name_a = _resolve(location_a)
+    id_b, name_b = _resolve(location_b)
+
+    if id_a is None:
+        return {"status": "error", "error": f"Unknown location: '{location_a}'"}
+    if id_b is None:
+        return {"status": "error", "error": f"Unknown location: '{location_b}'"}
+    if id_a == id_b:
+        return {"status": "error", "error": "location_a and location_b must be different"}
+
+    if id_a == HOME_ID or id_b == HOME_ID:
+        other_id = id_b if id_a == HOME_ID else id_a
+        other_name = name_b if id_a == HOME_ID else name_a
+        loc.set_miles_from_home(other_id, miles)
+    else:
+        loc.set_leg_distance(id_a, id_b, miles)
+
+    return {"status": "ok", "leg": {"from": name_a, "to": name_b, "miles": miles}}
+
+
+@mcp.tool
 def resolve_location(query: str) -> dict[str, Any]:
     """Look up a saved location by name or alias.
 
@@ -194,6 +401,18 @@ def list_locations() -> dict[str, Any]:
     """List all saved locations, most-used first."""
     rows = loc.all_locations()
     return {"locations": rows, "count": len(rows)}
+
+
+@mcp.tool
+def list_legs() -> dict[str, Any]:
+    """List all cached inter-stop driving distances.
+
+    Shows every A↔B pair in the leg-distance cache. Home-to-location
+    distances live on each location (see list_locations) and are not shown here.
+    Useful for auditing or correcting cached values before logging a route.
+    """
+    legs = loc.list_leg_distances()
+    return {"leg_count": len(legs), "legs": legs}
 
 
 @mcp.tool

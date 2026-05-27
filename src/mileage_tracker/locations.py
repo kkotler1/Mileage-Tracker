@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import tempfile
@@ -10,6 +11,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import LOCATIONS_FILE
+
+log = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
@@ -20,15 +23,32 @@ def _empty_store() -> dict[str, Any]:
     return {
         "home": {"name": "Home", "notes": None},
         "locations": [],
+        "distances": {},
     }
+
+
+def _leg_key(id_a: str, id_b: str) -> str:
+    """Canonical key for a pair of location IDs — order-independent."""
+    return ":".join(sorted([id_a, id_b]))
 
 
 def load() -> dict[str, Any]:
     if not LOCATIONS_FILE.exists():
         LOCATIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
         save(_empty_store())
+        return _empty_store()
     with LOCATIONS_FILE.open("r") as f:
-        return json.load(f)
+        try:
+            return json.load(f)
+        except json.JSONDecodeError as e:
+            backup = LOCATIONS_FILE.with_suffix(f".corrupt.{_now_iso().replace(':', '-')}.json")
+            LOCATIONS_FILE.rename(backup)
+            log.error(
+                "locations.json is corrupt (%s) — backed up to %s, starting fresh",
+                e, backup,
+            )
+            save(_empty_store())
+            return _empty_store()
 
 
 def save(store: dict[str, Any]) -> None:
@@ -120,6 +140,30 @@ def upsert(
     return row
 
 
+def get_leg_distance(id_a: str, id_b: str) -> float | None:
+    """Look up cached one-way miles between two location IDs (order-independent)."""
+    distances = load().get("distances", {})
+    val = distances.get(_leg_key(id_a, id_b))
+    return float(val) if val is not None else None
+
+
+def set_leg_distance(id_a: str, id_b: str, miles: float) -> None:
+    """Store one-way miles between two location IDs (order-independent)."""
+    store = load()
+    store.setdefault("distances", {})[_leg_key(id_a, id_b)] = miles
+    save(store)
+
+
+def set_miles_from_home(location_id: str, miles: float) -> None:
+    """Overwrite miles_from_home for a location by ID."""
+    store = load()
+    for r in store["locations"]:
+        if r.get("id") == location_id:
+            r["miles_from_home"] = miles
+            break
+    save(store)
+
+
 def touch(location_id: str) -> None:
     store = load()
     for r in store["locations"]:
@@ -136,3 +180,18 @@ def all_locations() -> list[dict[str, Any]]:
         rows,
         key=lambda r: (-(r.get("use_count") or 0), r.get("name") or ""),
     )
+
+
+def list_leg_distances() -> list[dict[str, Any]]:
+    """Return all cached inter-stop distances with resolved location names."""
+    store = load()
+    loc_index = {r["id"]: r["name"] for r in store["locations"]}
+    result = []
+    for key, miles in sorted(store.get("distances", {}).items()):
+        id_a, id_b = key.split(":", 1)
+        result.append({
+            "from": loc_index.get(id_a, id_a),
+            "to": loc_index.get(id_b, id_b),
+            "miles": miles,
+        })
+    return result

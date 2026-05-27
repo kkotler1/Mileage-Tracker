@@ -12,14 +12,17 @@ Same backend pattern as the receipt extractor (Sheet + local cache file).
 
 | Tool | Purpose |
 |---|---|
-| `log_trip` | Log a trip ("Potomac Swim Club", round-trip from home). Returns `needs_input` if the place is unknown. |
+| `log_trip` | Log a trip to a single destination (round-trip or one-way from home). Returns `needs_input` if the place is unknown. |
+| `log_route` | Log a multi-stop route. Resolves all legs from the cache; returns `needs_legs` for any unknown inter-stop distances. |
 | `add_location` | Register a place with `miles_from_home` + aliases. Use after a `needs_input`. |
+| `add_leg` | Cache the one-way miles between two locations (or between a location and Home). Used to pre-populate inter-stop distances for `log_route`. |
 | `resolve_location` | Look up which saved place a query matches. |
 | `list_locations` | Show every saved place, most-used first. |
+| `list_legs` | Show all cached inter-stop distances (A↔B pairs). |
 | `mileage_query` | Sum miles + deduction for a year or date range, optionally grouped by month/destination/purpose. |
 | `mileage_status` | Quick YTD snapshot with recent trips. |
 
-### Example flow
+### Single-destination flow
 
 ```
 You:    "I went to the Potomac Swim Club twice this week"
@@ -34,6 +37,29 @@ Server: 2 round-trips logged, 34.0 miles, $23.80 deduction
 ```
 
 Next time you say "I went to Potomac Swim Club", no question — cached.
+
+### Multi-stop route flow
+
+```
+You:    "Log my vending route: home → Sam's → Walmart → Club → home"
+Claude: log_route(stops=["home","Sam's Club","Walmart","the club","home"])
+Server: needs_legs — missing inter-stop distances:
+          Sam's Club → Walmart
+          Walmart → Potomac Swim Club
+Claude: "How far is Sam's to Walmart? Walmart to the Club?"
+You:    "4.6 miles, 17.0 miles"
+Claude: log_route(
+          stops=["home","Sam's Club","Walmart","the club","home"],
+          leg_overrides=[
+            {"from":"Sam's Club","to":"Walmart","miles":4.6},
+            {"from":"Walmart","to":"the club","miles":17.0}
+          ]
+        )
+Server: logged — 41.3 mi, $28.91 deduction
+        newly_cached_legs: Sam's↔Walmart (4.6), Walmart↔Club (17.0)
+```
+
+Next time you log the same route, all legs resolve automatically — no questions.
 
 ## Sheet format
 
@@ -190,4 +216,5 @@ Settings → Integrations → Add MCP server → `https://minisforum.tail2b7516.
 - `miles_from_home` is always **one-way**. `log_trip` doubles it for round-trips. Don't store round-trip values.
 - Locations file is a plain JSON — safe to edit by hand if you mistyped a distance.
 - If you move, update the home row's `notes` in the JSON and re-verify every distance.
-- Multi-stop chains (Walmart → Sam's → home) aren't supported in v1 — log each as its own round-trip. Real fix is a pair-distance cache; punt until you actually need it.
+- Multi-stop routes are logged as a single Sheet row with the full route label as the Destination. The per-leg breakdown is returned in the tool response but not stored as separate rows.
+- **One-off cleanup:** there is a placeholder location "Supply loop 2026-05-26 (Sam's→Walmart→Club)" and a one_way trip logged against it from before `log_route` existed. Once you've re-logged that route via `log_route`, you can delete the placeholder row from the Sheet and remove the location from `~/.mileage_locations.json` if you want a clean record.
