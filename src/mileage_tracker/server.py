@@ -22,10 +22,31 @@ from fastmcp import FastMCP
 
 from . import locations as loc
 from . import sheet
-from .config import IRS_MILEAGE_RATE, MCP_HOST, MCP_PORT, MCP_TRANSPORT
+from .config import (
+    AUTHKIT_DOMAIN,
+    IRS_MILEAGE_RATE,
+    MCP_HOST,
+    MCP_PORT,
+    MCP_TRANSPORT,
+    PUBLIC_BASE_URL,
+)
 from .dates import parse_date, today, year_bounds
 
-mcp = FastMCP("mileage-tracker")
+
+def _build_auth():
+    """WorkOS AuthKit provider for the public http server, or None (authless).
+
+    Only enabled for http transport with both env vars set, so stdio (local
+    Claude Code) and an unconfigured deployment both stay authless.
+    """
+    if MCP_TRANSPORT == "stdio" or not (AUTHKIT_DOMAIN and PUBLIC_BASE_URL):
+        return None
+    from fastmcp.server.auth.providers.workos import AuthKitProvider
+
+    return AuthKitProvider(authkit_domain=AUTHKIT_DOMAIN, base_url=PUBLIC_BASE_URL)
+
+
+mcp = FastMCP("mileage-tracker", auth=_build_auth())
 
 
 # ---------------------------------------------------------------- helpers
