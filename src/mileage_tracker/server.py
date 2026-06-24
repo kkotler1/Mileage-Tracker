@@ -5,9 +5,14 @@ Caches locations + per-place miles_from_home in a local JSON file.
 
 Tools:
     - log_trip
+    - log_route
     - add_location
+    - add_leg
     - resolve_location
     - list_locations
+    - list_legs
+    - edit_trip
+    - delete_trip
     - mileage_query
     - mileage_status
 """
@@ -531,6 +536,147 @@ def mileage_status() -> dict[str, Any]:
         "trip_count": len(rows),
         "recent_trips": [r for _, r in rows[:5]],
     }
+
+
+def _trip_summary(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "date": row.get("Date"),
+        "destination": row.get("Destination"),
+        "purpose": row.get("Purpose"),
+        "shape": row.get("Shape"),
+        "miles": _row_miles(row),
+        "trip_id": row.get("Trip ID"),
+    }
+
+
+@mcp.tool
+def edit_trip(
+    trip_id: str | None = None,
+    date: str | None = None,
+    destination: str | None = None,
+    new_destination: str | None = None,
+    purpose: str | None = None,
+    shape: str | None = None,
+    miles: float | None = None,
+    new_date: str | None = None,
+) -> dict[str, Any]:
+    """Retroactively edit a single logged trip.
+
+    Locate the trip by `trip_id` (unique, preferred) or by `date` — narrow with
+    `destination` (case-insensitive substring) when a date has several trips.
+    Edits only when EXACTLY one row matches; returns `ambiguous` with candidates
+    otherwise. Only the fields you pass change.
+
+    Args:
+        trip_id: Exact Trip ID from log_trip/log_route (e.g. "trip_1a2b3c4d").
+        date: ISO date or keyword ("today", "yesterday", "N days ago") to locate by.
+        destination: Substring to disambiguate among trips on the same date.
+        new_destination: Rename the trip's destination.
+        purpose: New business purpose.
+        shape: New shape label (e.g. "round_trip", "one_way").
+        miles: New mileage — the Deduction $ is recomputed automatically.
+        new_date: Move the trip to a different date; the sheet is kept date-sorted.
+    """
+    if not trip_id and not date:
+        return {"status": "error", "error": "provide trip_id or date to locate the trip"}
+    if miles is not None and miles < 0:
+        return {"status": "error", "error": "miles must be >= 0"}
+
+    loc_date = parse_date(date).isoformat() if date else None
+    matches = sheet.locate_trips(trip_id=trip_id, date=loc_date, destination=destination)
+    if not matches:
+        return {"status": "no_match", "criteria": {"trip_id": trip_id, "date": loc_date, "destination": destination}}
+    if len(matches) > 1:
+        return {
+            "status": "ambiguous",
+            "matches": [_trip_summary(r) for _, r in matches],
+            "instruction": "Several trips match. Pass trip_id, or add destination, to pick one.",
+        }
+
+    row_number, row = matches[0]
+
+    updates: dict[str, Any] = {}
+    if new_destination is not None:
+        updates["Destination"] = new_destination
+    if purpose is not None:
+        updates["Purpose"] = purpose
+    if shape is not None:
+        updates["Shape"] = shape
+    if miles is not None:
+        updates["Miles"] = miles
+        updates["Deduction $"] = _money(miles)
+
+    if not updates and not new_date:
+        return {"status": "no_changes", "target": _trip_summary(row)}
+
+    resorted = False
+    if new_date:
+        # A date change can break sort order — delete + reinsert in date order.
+        merged = dict(row)
+        merged.update(updates)
+        merged["Date"] = parse_date(new_date).isoformat()
+        sheet.delete_trip_row(row_number)
+        sheet.append_trip(merged)
+        resorted = True
+        final = merged
+    else:
+        sheet.update_trip_row(row_number, updates)
+        final = dict(row)
+        final.update(updates)
+
+    return {
+        "status": "updated",
+        "resorted": resorted,
+        "changed_fields": sorted(set(updates) | ({"Date"} if new_date else set())),
+        "trip": _trip_summary(final),
+    }
+
+
+@mcp.tool
+def delete_trip(
+    trip_id: str | None = None,
+    date: str | None = None,
+    destination: str | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Delete a single logged trip (two-step, guarded).
+
+    Locate by `trip_id` (unique, preferred) or by `date` — narrow with
+    `destination` (substring) when needed. Acts only on an EXACT single match:
+    0 or >1 returns candidates to narrow. The first call returns
+    `confirm_required` with the matched trip; call again with `confirm=True` to
+    actually delete.
+
+    Args:
+        trip_id: Exact Trip ID from log_trip/log_route.
+        date: ISO date or keyword to locate by.
+        destination: Substring to disambiguate among trips on the same date.
+        confirm: Must be True on the second call to perform the deletion.
+    """
+    if not trip_id and not date:
+        return {"status": "error", "error": "provide trip_id or date to locate the trip"}
+
+    loc_date = parse_date(date).isoformat() if date else None
+    matches = sheet.locate_trips(trip_id=trip_id, date=loc_date, destination=destination)
+    if not matches:
+        return {"status": "no_match", "criteria": {"trip_id": trip_id, "date": loc_date, "destination": destination}}
+    if len(matches) > 1:
+        return {
+            "status": "ambiguous",
+            "matches": [_trip_summary(r) for _, r in matches],
+            "instruction": "Several trips match. Pass trip_id, or add destination, to pick one.",
+        }
+
+    row_number, row = matches[0]
+    if not confirm:
+        return {
+            "status": "confirm_required",
+            "target": _trip_summary(row),
+            "instruction": "Call delete_trip again with confirm=True to remove this trip.",
+        }
+
+    sheet.delete_trip_row(row_number)
+    return {"status": "deleted", "deleted": _trip_summary(row)}
 
 
 # ---------------------------------------------------------------- entrypoint
