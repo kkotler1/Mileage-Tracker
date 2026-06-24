@@ -6,6 +6,7 @@ One row per trip in IRS-log format:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import gspread
@@ -128,3 +129,57 @@ def append_trip(row: dict[str, Any]) -> None:
 def read_trips() -> list[dict[str, Any]]:
     # Exclude the totals row from query results.
     return [r for r in ws().get_all_records() if r.get("Date") != TOTALS_MARKER]
+
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def locate_trips(
+    trip_id: str | None = None,
+    date: str | None = None,
+    destination: str | None = None,
+) -> list[tuple[int, dict[str, Any]]]:
+    """Return (sheet_row_number, row_dict) for trips matching the criteria.
+
+    row_number is the 1-based sheet row index (usable with update/delete).
+    Matching: exact Trip ID (unique), exact ISO Date, and/or case-insensitive
+    substring in Destination. The TOTAL footer and non-date rows are skipped.
+    Reads raw values so the true row index is preserved.
+    """
+    all_values = ws().get_all_values()
+    if not all_values:
+        return []
+
+    headers = all_values[0]
+    matches: list[tuple[int, dict[str, Any]]] = []
+    for i, r in enumerate(all_values[1:], start=2):
+        row = {h: (r[j] if j < len(r) else "") for j, h in enumerate(headers)}
+        row_date = str(row.get("Date", "")).strip()
+        if row_date == TOTALS_MARKER:
+            continue
+        if trip_id is not None:
+            if str(row.get("Trip ID", "")).strip() != trip_id.strip():
+                continue
+        elif date is not None:
+            if row_date != date:
+                continue
+        elif not _ISO_DATE_RE.match(row_date):
+            # No id/date filter: skip blanks and any non-trip rows.
+            continue
+        if destination and destination.lower() not in str(row.get("Destination", "")).lower():
+            continue
+        matches.append((i, row))
+    return matches
+
+
+def update_trip_row(row_number: int, updates: dict[str, Any]) -> None:
+    """Update specific columns of an existing row in place. Keys must be header names."""
+    worksheet = ws()
+    for header, value in updates.items():
+        if header not in HEADERS:
+            continue
+        worksheet.update_cell(row_number, HEADERS.index(header) + 1, _safe_cell(header, value))
+
+
+def delete_trip_row(row_number: int) -> None:
+    ws().delete_rows(row_number)
