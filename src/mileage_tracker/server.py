@@ -326,7 +326,8 @@ def log_route(
             if not was_cached:
                 newly_cached.append({"from": ov_name_a, "to": ov_name_b, "miles": ov_miles})
 
-    total_miles = round(sum(d for _, _, d in legs), 2)
+    # All legs are resolved here — the missing_legs guard above returns early.
+    total_miles = round(sum(d for _, _, d in legs if d is not None), 2)
     route_label = " → ".join(r["name"] for r in resolved)
     tid = _trip_id()
     sheet.append_trip({
@@ -399,7 +400,6 @@ def add_leg(
 
     if id_a == HOME_ID or id_b == HOME_ID:
         other_id = id_b if id_a == HOME_ID else id_a
-        other_name = name_b if id_a == HOME_ID else name_a
         loc.set_miles_from_home(other_id, miles)
     else:
         loc.set_leg_distance(id_a, id_b, miles)

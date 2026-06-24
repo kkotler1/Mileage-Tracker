@@ -12,9 +12,48 @@ dependencies = [
     "python-dotenv>=1.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+mileage-tracker = "mileage_tracker.server:main"
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+# Lint the package and its test/preflight harness only; skip one-off scripts.
+src = ["src"]
+target-version = "py311"
+line-length = 120
+extend-exclude = [".venv", "scripts"]
+
+[tool.ruff.lint]
+# Pyflakes (F) + a slice of pycodestyle (E) catches the real bugs — unused
+# imports/vars, undefined names — without fighting the existing code style.
+select = ["F", "E9"]
+
+[tool.mypy]
+# Scope: the MCP tool surface (server/sheet/locations/dates/config).
+# ignore_missing_imports keeps untyped deps (fastmcp) from drowning the signal;
+# check_untyped_defs makes mypy still inspect our own annotated logic.
+files = ["src/mileage_tracker"]
+python_version = "3.11"
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_redundant_casts = true
+
+[[tool.mypy.overrides]]
+# sheet.py passes plain "USER_ENTERED" string literals to gspread, whose stubs
+# type value_input_option as a strict ValueInputOption enum. The values are
+# correct at runtime; relax arg-type at this I/O boundary rather than rewrite
+# stable sheet plumbing to satisfy third-party stubs.
+module = "mileage_tracker.sheet"
+disable_error_code = ["arg-type"]
